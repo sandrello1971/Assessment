@@ -1,0 +1,18 @@
+# Esclude ambienti virtuali Python
+venv/
+env/
+.venv/
+
+# Esclude file di cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Esclude file di log
+*.log
+logs/
+
+# Esclude file temporanei
+*.tmp
+*.temp
+
