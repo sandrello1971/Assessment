@@ -1,0 +1,1319 @@
+# app/routers/radar.py - VERSIONE COMPLETA FINALE CON FIX URL ENCODING
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse, Response
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from uuid import UUID
+from app import database, models
+from dotenv import load_dotenv
+from urllib.parse import unquote  # Per compatibilità con vecchi endpoint
+import matplotlib.pyplot as plt
+import matplotlib
+import io
+import numpy as np
+import openai
+import os
+import math
+import traceback
+
+# Configura matplotlib per headless server
+matplotlib.use('Agg')
+
+load_dotenv()
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+model = os.getenv("OPENAI_MODEL", "gpt-4")
+
+router = APIRouter()
+
+# ============================================================================
+# ENDPOINT PRINCIPALI
+# ============================================================================
+
+@router.get("/assessment/{session_id}/processes-radar")
+def processes_radar_data(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Restituisce i dati radar separati per ogni processo"""
+    try:
+        print(f"🎯 DEBUG: processes_radar_data per sessione {session_id}")
+        
+        # Query per ottenere punteggi medi per processo e categoria
+        results = (
+            db.query(
+                models.AssessmentResult.process,
+                models.AssessmentResult.category,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .group_by(models.AssessmentResult.process, models.AssessmentResult.category)
+            .all()
+        )
+
+        print(f"🔍 DEBUG: Trovati {len(results) if results else 0} risultati")
+
+        if not results:
+            print(f"❌ DEBUG: Nessun risultato per sessione {session_id}")
+            raise HTTPException(status_code=404, detail="No results found for this session")
+
+        # Organizza i dati per processo
+        processes_data = {}
+        
+        for process, category, avg_score in results:
+            if process not in processes_data:
+                processes_data[process] = {
+                    "process": process,
+                    "dimensions": {},
+                    "overall_score": 0
+                }
+            
+            # Mappa le categorie alle 4 dimensioni del Politecnico di Milano
+            dimension_mapping = {
+                "Governance": "governance",
+                "Process": "governance", 
+                "Monitoring": "monitoring_control",
+                "Monitoring & Control": "monitoring_control",
+                "Control": "monitoring_control",
+                "Technology": "technology",
+                "Tech": "technology",
+                "ICT": "technology",
+                "Organization": "organization",
+                "Org": "organization",
+                "People": "organization"
+            }
+            
+            # Trova la dimensione corrispondente
+            dimension_key = None
+            for key, value in dimension_mapping.items():
+                if key.lower() in category.lower():
+                    dimension_key = value
+                    break
+            
+            if dimension_key:
+                processes_data[process]["dimensions"][dimension_key] = round(float(avg_score), 2)
+
+        # Calcola il punteggio complessivo per ogni processo
+        for process_key in processes_data:
+            dimensions = processes_data[process_key]["dimensions"]
+            if dimensions:
+                overall = sum(dimensions.values()) / len(dimensions)
+                processes_data[process_key]["overall_score"] = round(overall, 2)
+                
+                # Determina il livello di maturità
+                if overall >= 4:
+                    status = "OTTIMO"
+                    level = 5
+                elif overall >= 3.5:
+                    status = "BUONO"
+                    level = 4
+                elif overall >= 2.5:
+                    status = "SUFFICIENTE"
+                    level = 3
+                elif overall >= 2:
+                    status = "CARENTE"
+                    level = 2
+                else:
+                    status = "CRITICO"
+                    level = 1
+                    
+                processes_data[process_key]["status"] = status
+                processes_data[process_key]["level"] = level
+
+        print(f"✅ DEBUG: Processati {len(processes_data)} processi")
+        
+        return {
+            "session_id": str(session_id),
+            "processes": list(processes_data.values()),
+            "total_processes": len(processes_data)
+        }
+        
+    except Exception as e:
+        print(f"❌ Errore in processes_radar_data: {e}")
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Errore nel calcolo dei dati radar per processo: {str(e)}")
+
+@router.get("/assessment/{session_id}/radar")
+def radar_data(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Restituisce i dati aggregati per il radar chart (compatibilità)"""
+    try:
+        print(f"🎯 DEBUG: radar_data per sessione {session_id}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.process,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .group_by(models.AssessmentResult.process)
+            .all()
+        )
+
+        print(f"🔍 DEBUG: radar_data trovati {len(results) if results else 0} processi")
+
+        if not results:
+            print(f"❌ DEBUG: Nessun risultato per radar_data sessione {session_id}")
+            raise HTTPException(status_code=404, detail="No results found for this session")
+
+        radar_output = []
+        for process, avg_score in results:
+            if avg_score >= 4:
+                status = "OTTIMO"
+                level = 5
+            elif avg_score >= 3.5:
+                status = "BUONO" 
+                level = 4
+            elif avg_score >= 2.5:
+                status = "SUFFICIENTE"
+                level = 3
+            elif avg_score >= 2:
+                status = "CARENTE"
+                level = 2
+            else:
+                status = "CRITICO"
+                level = 1
+
+            radar_output.append({
+                "process": process,
+                "avg_score": round(avg_score, 2),
+                "status": status,
+                "level": level
+            })
+
+        print(f"✅ DEBUG: radar_data restituendo {len(radar_output)} processi")
+
+        return {
+            "benchmarks": 4,
+            "ratings": radar_output,
+            "session_id": str(session_id),
+            "total_processes": len(radar_output)
+        }
+        
+    except Exception as e:
+        print(f"❌ Errore in radar_data: {e}")
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Errore nel calcolo dei dati radar: {str(e)}")
+
+@router.get("/assessment/{session_id}/radar-image")
+def radar_image(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Genera l'immagine del radar chart aggregato - SEMPRE RADAR CLASSICO"""
+    try:
+        print(f"🎯 RADAR IMAGE: Inizio generazione radar classico per sessione {session_id}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.process,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .group_by(models.AssessmentResult.process)
+            .all()
+        )
+
+        print(f"🔍 RADAR IMAGE: Trovati {len(results) if results else 0} processi")
+        
+        if not results:
+            print(f"❌ RADAR IMAGE: Nessun dato, creando placeholder")
+            return create_placeholder_radar_image()
+
+        # Estrai e processa labels e values
+        raw_labels = [r[0] for r in results]
+        values = [float(r[1]) for r in results]
+        
+        print(f"📊 RADAR IMAGE: Processi da visualizzare:")
+        for i, (label, val) in enumerate(zip(raw_labels, values)):
+            print(f"  {i+1}. {label}: {val:.2f}")
+        
+        # FORZA SEMPRE RADAR CLASSICO (anche per 8+ processi)
+        print("🎯 RADAR IMAGE: Forzando radar chart classico")
+        return create_radar_chart_optimized(raw_labels, values)
+        
+    except Exception as e:
+        print(f"💥 RADAR IMAGE: Errore {str(e)}")
+        print(f"💥 RADAR IMAGE: Traceback {traceback.format_exc()}")
+        return create_error_image(session_id, str(e))
+
+@router.get("/assessment/{session_id}/summary-radar-svg")
+def summary_radar_svg(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Genera un radar chart SVG riassuntivo"""
+    try:
+        print(f"🎯 SVG RADAR: Generando per sessione {session_id}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.process,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .group_by(models.AssessmentResult.process)
+            .all()
+        )
+
+        print(f"🔍 SVG RADAR: Trovati {len(results) if results else 0} processi")
+
+        if not results:
+            print("❌ SVG RADAR: Nessun dato, usando placeholder")
+            return Response(content=create_placeholder_summary_radar_svg(), media_type="image/svg+xml")
+
+        # Organizza i dati
+        processes_scores = {}
+        for process, avg_score in results:
+            processes_scores[process] = float(avg_score)
+            print(f"  📊 {process}: {avg_score}")
+
+        # Genera SVG radar classico
+        svg_content = create_summary_radar_svg_classic(processes_scores)
+        return Response(content=svg_content, media_type="image/svg+xml")
+        
+    except Exception as e:
+        print(f"💥 SVG RADAR: Errore {e}")
+        print(f"💥 SVG RADAR: Traceback {traceback.format_exc()}")
+        error_svg = create_error_summary_radar_svg()
+        return Response(content=error_svg, media_type="image/svg+xml")
+
+# ============================================================================
+# ENDPOINT PROCESSO SINGOLO - VERSIONE FISSA CON QUERY PARAMETERS
+# ============================================================================
+
+@router.get("/assessment/{session_id}/process-radar-svg")  # ✅ RIMOSSO {process_name} dal path
+def process_radar_svg_fixed(session_id: UUID, process_name: str, db: Session = Depends(database.get_db)):
+    """Genera un radar chart SVG per un singolo processo - VERSIONE FISSA"""
+    try:
+        # Non serve più unquote() perché process_name arriva come query parameter
+        print(f"🎯 [FIXED] Generando radar SVG per processo: {process_name}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.category,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .filter(models.AssessmentResult.process == process_name)  # Ora funziona!
+            .group_by(models.AssessmentResult.category)
+            .all()
+        )
+
+        if not results:
+            print(f"❌ [FIXED] Nessun risultato per processo {process_name}")
+            svg_content = create_placeholder_radar_svg(process_name)
+            return Response(content=svg_content, media_type="image/svg+xml")
+
+        # Prepara dimensioni
+        dimensions = {
+            "Governance": 0.0,
+            "Monitoring": 0.0, 
+            "Technology": 0.0,
+            "Organization": 0.0
+        }
+        
+        dimension_mapping = {
+            "Governance": "Governance", "Process": "Governance",
+            "Monitoring": "Monitoring", "Control": "Monitoring", 
+            "Technology": "Technology", "Tech": "Technology", "ICT": "Technology",
+            "Organization": "Organization", "Org": "Organization", "People": "Organization"
+        }
+
+        for category, avg_score in results:
+            for key, dimension in dimension_mapping.items():
+                if key.lower() in category.lower():
+                    dimensions[dimension] = float(avg_score)
+                    break
+
+        print(f"📊 [FIXED] Dimensioni per {process_name}: {dimensions}")
+        svg_content = create_radar_svg(dimensions, process_name)
+        return Response(content=svg_content, media_type="image/svg+xml")
+        
+    except Exception as e:
+        print(f"💥 [FIXED] Errore process radar svg: {e}")
+        print(f"💥 [FIXED] Traceback: {traceback.format_exc()}")
+        error_svg = create_error_radar_svg(process_name)
+        return Response(content=error_svg, media_type="image/svg+xml")
+
+@router.get("/assessment/{session_id}/process-radar-image")  # ✅ RIMOSSO {process_name} dal path
+def process_radar_image_fixed(session_id: UUID, process_name: str, db: Session = Depends(database.get_db)):
+    """Genera l'immagine del radar chart per un singolo processo - VERSIONE FISSA"""
+    try:
+        # Non serve più unquote() perché process_name arriva come query parameter
+        print(f"🎯 [FIXED] Generando radar matplotlib per processo: {process_name}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.category,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .filter(models.AssessmentResult.process == process_name)  # Ora funziona!
+            .group_by(models.AssessmentResult.category)
+            .all()
+        )
+
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No results found for process {process_name}")
+
+        # Prepara i dati per le 4 dimensioni
+        dimensions = {
+            "Governance": 0,
+            "Monitoring": 0, 
+            "Technology": 0,
+            "Organization": 0
+        }
+        
+        dimension_mapping = {
+            "Governance": "Governance", "Process": "Governance",
+            "Monitoring": "Monitoring", "Control": "Monitoring", 
+            "Technology": "Technology", "Tech": "Technology", "ICT": "Technology",
+            "Organization": "Organization", "Org": "Organization", "People": "Organization"
+        }
+
+        for category, avg_score in results:
+            for key, dimension in dimension_mapping.items():
+                if key.lower() in category.lower():
+                    dimensions[dimension] = float(avg_score)
+                    break
+
+        # Dati per il radar chart
+        labels = list(dimensions.keys())
+        values = list(dimensions.values())
+        
+        # Calcola angoli per 4 dimensioni
+        angles = np.linspace(0, 2 * np.pi, 4, endpoint=False).tolist()
+        angles += angles[:1]  # Chiudi il cerchio
+        values += values[:1]   # Chiudi il cerchio
+        labels += labels[:1]   # Chiudi il cerchio
+
+        # Crea il grafico radar
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+        
+        # Disegna il radar
+        ax.plot(angles, values, linewidth=3, linestyle='solid', color='#3B82F6', alpha=0.9)
+        ax.fill(angles, values, alpha=0.25, color='#3B82F6')
+        
+        # Configura gli assi
+        ax.set_yticks([1, 2, 3, 4, 5])
+        ax.set_yticklabels(['1', '2', '3', '4', '5'], fontsize=11)
+        ax.set_ylim(0, 5)
+        
+        # Configura le etichette
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(labels[:-1], fontsize=12, fontweight='bold')
+        
+        # Stile
+        ax.grid(True, alpha=0.3)
+        ax.set_facecolor('white')
+        ax.set_title(f"{process_name}\nDigital Assessment", 
+                    fontsize=14, fontweight='bold', pad=20, color='#1F2937')
+
+        # Salva in buffer
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none', transparent=False)
+        plt.close(fig)
+        buf.seek(0)
+
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except Exception as e:
+        print(f"💥 [FIXED] Errore in process_radar_image: {e}")
+        print(f"💥 [FIXED] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Errore nella generazione del radar chart: {str(e)}")
+
+# ============================================================================
+# ENDPOINT LEGACY - COMPATIBILITÀ RETROGRADA (CON PATH PARAMETERS)
+# ============================================================================
+
+@router.get("/assessment/{session_id}/process-radar-svg/{process_name}")
+def process_radar_svg_legacy(session_id: UUID, process_name: str, db: Session = Depends(database.get_db)):
+    """Genera un radar chart SVG per un singolo processo - LEGACY (manteniamo per compatibilità)"""
+    try:
+        # Prova con URL decoding
+        decoded_process_name = unquote(process_name)
+        print(f"🔍 [LEGACY] Process originale URL: {process_name}")
+        print(f"🔍 [LEGACY] Process decodificato: {decoded_process_name}")
+        print(f"🎯 [LEGACY] Generando radar SVG per processo: {decoded_process_name}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.category,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .filter(models.AssessmentResult.process == decoded_process_name)
+            .group_by(models.AssessmentResult.category)
+            .all()
+        )
+
+        if not results:
+            print(f"❌ [LEGACY] Nessun risultato per processo {decoded_process_name}")
+            # Reindirizza alla versione fissa con query parameter
+            return Response(
+                content=f'<svg width="300" height="300" xmlns="http://www.w3.org/2000/svg"><rect width="300" height="300" fill="#fff3cd"/><text x="150" y="140" font-family="Arial" font-size="12" text-anchor="middle" fill="#856404">Endpoint deprecato</text><text x="150" y="160" font-family="Arial" font-size="10" text-anchor="middle" fill="#856404">Usa: ?process_name={decoded_process_name}</text></svg>',
+                media_type="image/svg+xml"
+            )
+
+        # Stesso codice della versione fissa per compatibilità
+        dimensions = {
+            "Governance": 0.0,
+            "Monitoring": 0.0, 
+            "Technology": 0.0,
+            "Organization": 0.0
+        }
+        
+        dimension_mapping = {
+            "Governance": "Governance", "Process": "Governance",
+            "Monitoring": "Monitoring", "Control": "Monitoring", 
+            "Technology": "Technology", "Tech": "Technology", "ICT": "Technology",
+            "Organization": "Organization", "Org": "Organization", "People": "Organization"
+        }
+
+        for category, avg_score in results:
+            for key, dimension in dimension_mapping.items():
+                if key.lower() in category.lower():
+                    dimensions[dimension] = float(avg_score)
+                    break
+
+        print(f"📊 [LEGACY] Dimensioni per {decoded_process_name}: {dimensions}")
+        svg_content = create_radar_svg(dimensions, decoded_process_name)
+        return Response(content=svg_content, media_type="image/svg+xml")
+        
+    except Exception as e:
+        print(f"💥 [LEGACY] Errore process radar svg: {e}")
+        print(f"💥 [LEGACY] Process name originale: {process_name}")
+        print(f"💥 [LEGACY] Traceback: {traceback.format_exc()}")
+        error_svg = create_error_radar_svg(process_name)
+        return Response(content=error_svg, media_type="image/svg+xml")
+
+@router.get("/assessment/{session_id}/process-radar-image/{process_name}")
+def process_radar_image_legacy(session_id: UUID, process_name: str, db: Session = Depends(database.get_db)):
+    """Genera l'immagine del radar chart per un singolo processo - LEGACY"""
+    try:
+        decoded_process_name = unquote(process_name)
+        print(f"🔍 [LEGACY] Process originale URL: {process_name}")
+        print(f"🔍 [LEGACY] Process decodificato: {decoded_process_name}")
+        print(f"🎯 [LEGACY] Generando radar matplotlib per processo: {decoded_process_name}")
+        
+        results = (
+            db.query(
+                models.AssessmentResult.category,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .filter(models.AssessmentResult.process == decoded_process_name)
+            .group_by(models.AssessmentResult.category)
+            .all()
+        )
+
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No results found for process {decoded_process_name}. Try using query parameter: ?process_name={decoded_process_name}")
+
+        # Stesso codice della versione fissa
+        dimensions = {
+            "Governance": 0,
+            "Monitoring": 0, 
+            "Technology": 0,
+            "Organization": 0
+        }
+        
+        dimension_mapping = {
+            "Governance": "Governance", "Process": "Governance",
+            "Monitoring": "Monitoring", "Control": "Monitoring", 
+            "Technology": "Technology", "Tech": "Technology", "ICT": "Technology",
+            "Organization": "Organization", "Org": "Organization", "People": "Organization"
+        }
+
+        for category, avg_score in results:
+            for key, dimension in dimension_mapping.items():
+                if key.lower() in category.lower():
+                    dimensions[dimension] = float(avg_score)
+                    break
+
+        # Crea il grafico
+        labels = list(dimensions.keys())
+        values = list(dimensions.values())
+        
+        angles = np.linspace(0, 2 * np.pi, 4, endpoint=False).tolist()
+        angles += angles[:1]
+        values += values[:1]
+        labels += labels[:1]
+
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+        ax.plot(angles, values, linewidth=3, linestyle='solid', color='#3B82F6', alpha=0.9)
+        ax.fill(angles, values, alpha=0.25, color='#3B82F6')
+        
+        ax.set_yticks([1, 2, 3, 4, 5])
+        ax.set_yticklabels(['1', '2', '3', '4', '5'], fontsize=11)
+        ax.set_ylim(0, 5)
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(labels[:-1], fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_facecolor('white')
+        ax.set_title(f"{decoded_process_name}\nDigital Assessment (Legacy)", 
+                    fontsize=14, fontweight='bold', pad=20, color='#1F2937')
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none', transparent=False)
+        plt.close(fig)
+        buf.seek(0)
+
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except Exception as e:
+        print(f"💥 [LEGACY] Errore in process_radar_image: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore nella generazione del radar chart: {str(e)}")
+
+# ============================================================================
+# ENDPOINT DEBUG E TEST
+# ============================================================================
+
+@router.get("/debug/process/{process_name}")
+def debug_process_name(process_name: str):
+    """Debug endpoint per testare URL decoding"""
+    decoded = unquote(process_name)
+    return {
+        "original_url_param": process_name,
+        "decoded_param": decoded,
+        "length_original": len(process_name),
+        "length_decoded": len(decoded),
+        "test_encoding": process_name == "DESIGN%20%26%20ENGINEERING",
+        "test_decoding": decoded == "DESIGN & ENGINEERING",
+        "contains_ampersand": "&" in decoded,
+        "url_safe_chars": all(c.isalnum() or c in "-._~" for c in process_name)
+    }
+
+@router.get("/debug/session/{session_id}/process/{process_name}")
+def debug_process_db_query(session_id: UUID, process_name: str, db: Session = Depends(database.get_db)):
+    """Debug endpoint per testare query database"""
+    decoded = unquote(process_name)
+    
+    # Query con nome originale
+    results_original = db.query(models.AssessmentResult).filter(
+        models.AssessmentResult.session_id == session_id,
+        models.AssessmentResult.process == process_name
+    ).all()
+    
+    # Query con nome decodificato
+    results_decoded = db.query(models.AssessmentResult).filter(
+        models.AssessmentResult.session_id == session_id,
+        models.AssessmentResult.process == decoded
+    ).all()
+    
+    # Tutti i processi per questa sessione
+    all_processes = db.query(models.AssessmentResult.process).filter(
+        models.AssessmentResult.session_id == session_id
+    ).distinct().all()
+    
+    return {
+        "process_original": process_name,
+        "process_decoded": decoded,
+        "results_with_original": len(results_original),
+        "results_with_decoded": len(results_decoded),
+        "all_processes_in_db": [p[0] for p in all_processes],
+        "exact_match_found": decoded in [p[0] for p in all_processes],
+        "recommendation": "use_query_parameter" if len(results_decoded) > 0 else "check_database"
+    }
+
+@router.get("/test-query-param")
+def test_query_param(process_name: str):
+    """Test endpoint per verificare query parameters"""
+    return {
+        "received_process_name": process_name,
+        "length": len(process_name),
+        "contains_ampersand": "&" in process_name,
+        "contains_space": " " in process_name,
+        "test_success": process_name == "DESIGN & ENGINEERING",
+        "message": "✅ Query parameter funziona correttamente!" if process_name == "DESIGN & ENGINEERING" else "⚠️ Valore non previsto"
+    }
+
+@router.get("/assessment/{session_id}/ai-suggestions")
+def ai_suggestions(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Genera suggerimenti AI basati sui punti critici"""
+    try:
+        results = (
+            db.query(
+                models.AssessmentResult.process,
+                models.AssessmentResult.category,
+                models.AssessmentResult.dimension,
+                models.AssessmentResult.score,
+                models.AssessmentResult.note
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .order_by(models.AssessmentResult.process, models.AssessmentResult.category)
+            .all()
+        )
+
+        if not results:
+            raise HTTPException(status_code=404, detail="No assessment results found")
+
+        # Aree critiche (< 3)
+        critical_areas = [
+            {
+                "process": r.process,
+                "category": r.category,
+                "dimension": r.dimension,
+                "score": r.score,
+                "note": r.note
+            }
+            for r in results if r.score < 3
+        ]
+
+        if not critical_areas:
+            return {
+                "message": "Nessuna area critica rilevata",
+                "critical_count": 0,
+                "suggestions": "🎉 Ottimo lavoro! Tutti i punteggi sono accettabili. Continuate a monitorare le performance e considerate miglioramenti incrementali per raggiungere l'eccellenza digitale."
+            }
+
+        # Costruisci prompt OpenAI
+        prompt = """Sei un esperto di trasformazione digitale per aziende manifatturiere italiane.
+Analizza questi punti critici da un assessment digitale 4.0:
+
+Punti critici:
+"""
+        
+        for item in critical_areas:
+            prompt += f"\n- 🔴 [{item['process']}] {item['category']} → {item['dimension']} (Punteggio: {item['score']}/5)\n"
+            if item['note']:
+                prompt += f"  💬 Nota: {item['note']}\n"
+
+        prompt += """
+
+Per ciascun punto critico, fornisci:
+1. 🎯 Azioni immediate (0-3 mesi)
+2. 💰 Investimenti minimi richiesti
+3. 📈 Benefici attesi
+4. 📊 KPI da monitorare
+
+Rispondi in italiano con un tono professionale ma accessibile."""
+
+        try:
+            if not openai.api_key:
+                return {
+                    "critical_count": len(critical_areas),
+                    "suggestions": "⚠️ API OpenAI non configurata. Configurare OPENAI_API_KEY per ottenere suggerimenti personalizzati."
+                }
+
+            response = openai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Sei un esperto di trasformazione digitale per aziende manifatturiere italiane."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=2000,
+                temperature=0.7
+            )
+            
+            return {
+                "critical_count": len(critical_areas),
+                "suggestions": response.choices[0].message.content
+            }
+            
+        except Exception as e:
+            print(f"❌ Errore OpenAI: {e}")
+            return {
+                "critical_count": len(critical_areas),
+                "suggestions": f"⚠️ Errore nel generare suggerimenti AI: {str(e)}\n\nPunti critici identificati: {len(critical_areas)} aree necessitano attenzione."
+            }
+            
+    except Exception as e:
+        print(f"❌ Errore ai_suggestions: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore suggerimenti: {str(e)}")
+
+@router.get("/assessment/{session_id}/summary")
+def assessment_summary(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Riepilogo completo assessment"""
+    try:
+        total_questions = db.query(models.AssessmentResult).filter(
+            models.AssessmentResult.session_id == session_id
+        ).count()
+        
+        if total_questions == 0:
+            raise HTTPException(status_code=404, detail="No assessment data found")
+        
+        # Media generale
+        avg_score = db.query(func.avg(models.AssessmentResult.score)).filter(
+            models.AssessmentResult.session_id == session_id
+        ).scalar()
+        
+        # Distribuzione punteggi
+        score_distribution = db.query(
+            models.AssessmentResult.score,
+            func.count(models.AssessmentResult.score).label('count')
+        ).filter(
+            models.AssessmentResult.session_id == session_id
+        ).group_by(models.AssessmentResult.score).all()
+        
+        # Punteggi per processo
+        process_scores = db.query(
+            models.AssessmentResult.process,
+            func.avg(models.AssessmentResult.score).label("avg_score"),
+            func.count(models.AssessmentResult.score).label("question_count")
+        ).filter(
+            models.AssessmentResult.session_id == session_id
+        ).group_by(models.AssessmentResult.process).all()
+        
+        return {
+            "session_id": str(session_id),
+            "total_questions": total_questions,
+            "overall_score": round(float(avg_score), 2) if avg_score else 0,
+            "score_distribution": [{"score": s, "count": c} for s, c in score_distribution],
+            "process_breakdown": [
+                {
+                    "process": p,
+                    "avg_score": round(float(avg), 2),
+                    "question_count": count,
+                    "percentage": round((float(avg) / 5) * 100, 1)
+                }
+                for p, avg, count in process_scores
+            ]
+        }
+        
+    except Exception as e:
+        print(f"❌ Errore summary: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore riepilogo: {str(e)}")
+
+# ============================================================================
+# ENDPOINT DI TEST E DEBUG
+# ============================================================================
+
+@router.get("/test-working-radar")
+def test_working_radar():
+    """Radar di test che funziona sempre - per verificare matplotlib"""
+    try:
+        print("🎯 TEST RADAR: Creando radar di test")
+        
+        # Dati di test fissi
+        labels = ['Processo A', 'Processo B', 'Processo C', 'Processo D', 'Processo E']
+        values = [3.2, 4.1, 2.8, 3.7, 3.5]
+        
+        return create_radar_chart_optimized(labels, values, title_override="🧪 Test Radar - Matplotlib Funzionante")
+        
+    except Exception as e:
+        print(f"💥 TEST RADAR: Errore {e}")
+        raise HTTPException(status_code=500, detail=f"Test radar fallito: {str(e)}")
+
+@router.get("/assessment/{session_id}/test-radar-debug")
+def test_radar_debug(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Endpoint di test per debug completo"""
+    try:
+        print(f"🔍 DEBUG TEST: Iniziando per sessione {session_id}")
+        
+        # Test 1: Verifica connessione DB
+        total_results = db.query(models.AssessmentResult).filter(
+            models.AssessmentResult.session_id == session_id
+        ).count()
+        
+        print(f"📊 DEBUG TEST: Totale risultati DB: {total_results}")
+        
+        if total_results == 0:
+            return {
+                "status": "ERROR",
+                "message": "Nessun risultato nel database",
+                "session_id": str(session_id),
+                "total_results": total_results
+            }
+        
+        # Test 2: Query processi
+        results = (
+            db.query(
+                models.AssessmentResult.process,
+                func.avg(models.AssessmentResult.score).label("avg_score")
+            )
+            .filter(models.AssessmentResult.session_id == session_id)
+            .group_by(models.AssessmentResult.process)
+            .all()
+        )
+        
+        print(f"📈 DEBUG TEST: Processi trovati: {len(results)}")
+        
+        processes_data = {}
+        for process, avg_score in results:
+            processes_data[process] = float(avg_score)
+            print(f"  • {process}: {avg_score}")
+        
+        # Test 3: Matplotlib
+        try:
+            fig, ax = plt.subplots(figsize=(5, 5))
+            ax.plot([1, 2, 3], [1, 2, 3])
+            ax.set_title("Matplotlib Test")
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", dpi=72)
+            plt.close(fig)
+            buf.seek(0)
+            
+            matplotlib_status = "OK"
+            
+        except Exception as e:
+            matplotlib_status = f"ERROR: {str(e)}"
+            print(f"❌ MATPLOTLIB ERROR: {e}")
+        
+        return {
+            "status": "SUCCESS",
+            "session_id": str(session_id),
+            "total_results": total_results,
+            "processes_found": len(results),
+            "processes_data": processes_data,
+            "matplotlib_status": matplotlib_status,
+            "debug_info": "Tutti i test completati - Radar classico forzato attivo + Query parameters fix"
+        }
+        
+    except Exception as e:
+        print(f"💥 DEBUG TEST: Errore {e}")
+        return {
+            "status": "ERROR",
+            "message": str(e),
+            "session_id": str(session_id),
+            "traceback": traceback.format_exc()
+        }
+
+@router.get("/assessment/{session_id}/force-working-radar")
+def force_working_radar(session_id: UUID, db: Session = Depends(database.get_db)):
+    """Radar che DEVE funzionare - usa dati veri o fake"""
+    try:
+        print(f"🎯 FORCE RADAR: Iniziando per {session_id}")
+        
+        # Prova dati veri
+        results = db.query(
+            models.AssessmentResult.process,
+            func.avg(models.AssessmentResult.score).label("avg_score")
+        ).filter(
+            models.AssessmentResult.session_id == session_id
+        ).group_by(models.AssessmentResult.process).all()
+        
+        if results and len(results) > 0:
+            # Usa dati veri
+            raw_labels = [r[0] for r in results]
+            values = [float(r[1]) for r in results]
+            title = f"Radar Forzato - {len(results)} Processi Reali"
+            print(f"📊 FORCE RADAR: Usando {len(results)} processi reali")
+            
+        else:
+            # Usa dati fake
+            raw_labels = ['Produzione', 'Qualità', 'Logistica', 'Manutenzione', 'Vendite', 'Marketing']
+            values = [3.2, 4.1, 2.8, 3.9, 3.5, 2.9]
+            title = "Radar Forzato - Dati Demo"
+            print("🎭 FORCE RADAR: Usando dati demo")
+        
+        # Crea sempre un radar classico
+        return create_radar_chart_optimized(raw_labels, values, title_override=title)
+        
+    except Exception as e:
+        print(f"💥 FORCE RADAR: Errore {e}")
+        return create_emergency_chart(str(e))
+
+# ============================================================================
+# FUNZIONI DI SUPPORTO PER MATPLOTLIB
+# ============================================================================
+
+def create_radar_chart_optimized(labels, values, title_override=None):
+    """Crea radar chart classico ottimizzato per qualsiasi numero di processi"""
+    try:
+        print(f"🎯 Creando radar chart ottimizzato per {len(labels)} processi...")
+        
+        # Tronca nomi per molti processi
+        display_labels = []
+        for label in labels:
+            if len(labels) > 6:  # Per molti processi, tronca di più
+                words = label.split()
+                if len(words) > 1:
+                    if len(words[0]) > 10:
+                        short = f"{words[0][:8]}..."
+                    else:
+                        short = f"{words[0]} {words[1][:3]}..." if len(words) > 1 else words[0][:10]
+                else:
+                    short = label[:8] + "..." if len(label) > 8 else label
+            else:
+                short = label[:15] + "..." if len(label) > 18 else label
+            display_labels.append(short)
+        
+        num_vars = len(labels)
+        angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
+        angles += angles[:1]
+        values_closed = values + [values[0]]
+        display_labels_closed = display_labels + [display_labels[0]]
+
+        # Crea radar con dimensioni adattive
+        fig_size = max(10, min(16, len(labels) * 1.2))  # Dimensioni intelligenti
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size), subplot_kw=dict(polar=True))
+        
+        # Disegna radar con stile migliorato
+        ax.plot(angles, values_closed, linewidth=4, linestyle='solid', color='#2E86AB', alpha=0.9)
+        ax.fill(angles, values_closed, alpha=0.3, color='#2E86AB')
+        
+        # Aggiungi punti colorati per distinguere i processi
+        colors = ['#3B82F6', '#EF4444', '#10B981', '#F59E0B', '#8B5CF6', '#F97316', '#06B6D4', '#84CC16']
+        for i, (angle, value) in enumerate(zip(angles[:-1], values)):
+            color = colors[i % len(colors)]
+            ax.plot(angle, value, 'o', color=color, markersize=10, 
+                   markeredgecolor='white', markeredgewidth=3, alpha=0.9)
+        
+        # Assi con stile migliorato
+        ax.set_yticks([1, 2, 3, 4, 5])
+        ax.set_yticklabels(['1', '2', '3', '4', '5'], fontsize=12, fontweight='bold')
+        ax.set_ylim(0, 5)
+        
+        # Etichette - dimensione font adattiva
+        label_fontsize = max(8, min(12, 16 - len(labels)))  # Font adattivo
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(display_labels, fontsize=label_fontsize, fontweight='bold')
+        
+        # Stile radar professionale
+        ax.grid(True, alpha=0.4, linewidth=1)
+        ax.set_facecolor('white')
+        
+        # Linee di riferimento colorate
+        for i, tick in enumerate([1, 2, 3, 4, 5]):
+            alpha = 0.15 + (i * 0.1)  # Alpha crescente
+            circle = plt.Circle((0, 0), tick, transform=ax.transData._b, 
+                              fill=False, color='gray', alpha=alpha, linewidth=1)
+        
+        # Titolo dinamico
+        if title_override:
+            title = title_override
+        else:
+            title = f"Digital Assessment 4.0 - Radar Chart ({len(labels)} Processi)"
+        
+        ax.set_title(title, fontsize=max(14, min(18, 20 - len(labels))), 
+                    fontweight='bold', pad=30, color='#1F4E79')
+
+        # Aggiungi legenda se ci sono molti processi
+        if len(labels) > 4:
+            legend_elements = []
+            for i, (label, color) in enumerate(zip(labels, colors[:len(labels)])):
+                legend_elements.append(plt.Line2D([0], [0], marker='o', color='w', 
+                                                markerfacecolor=color, markersize=8, 
+                                                label=label[:20] + ('...' if len(label) > 20 else ''),
+                                                markeredgecolor='white', markeredgewidth=2))
+            
+            ax.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.1, 0.5),
+                     fontsize=max(8, min(10, 12 - len(labels)//2)), frameon=True, 
+                     fancybox=True, shadow=True)
+
+        # Salva con qualità alta
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none', pad_inches=0.2)
+        plt.close(fig)
+        buf.seek(0)
+
+        print("✅ Radar chart ottimizzato creato con successo")
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except Exception as e:
+        print(f"💥 Errore radar chart ottimizzato: {e}")
+        print(f"💥 Traceback: {traceback.format_exc()}")
+        raise
+
+def create_placeholder_radar_image():
+    """Placeholder quando non ci sono dati"""
+    try:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.text(0.5, 0.5, 'Nessun dato disponibile\nper il Radar Chart', 
+                ha='center', va='center', fontsize=18, color='#6B7280',
+                bbox=dict(boxstyle="round,pad=1", facecolor="#F9FAFB", edgecolor="#E5E7EB"))
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title("Digital Assessment 4.0", fontsize=20, pad=20, color='#1F2937')
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        buf.seek(0)
+        
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        print(f"Errore placeholder: {e}")
+        raise HTTPException(status_code=500, detail="Errore generazione placeholder")
+
+def create_error_image(session_id, error_msg):
+    """Immagine di errore"""
+    try:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.text(0.5, 0.6, '❌ Errore Generazione Radar', 
+               ha='center', va='center', fontsize=18, color='#DC2626', fontweight='bold')
+        ax.text(0.5, 0.4, f'Sessione: {session_id}', 
+               ha='center', va='center', fontsize=12, color='#374151')
+        ax.text(0.5, 0.2, f'Errore: {error_msg[:60]}...', 
+               ha='center', va='center', fontsize=10, color='#6B7280')
+        
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title("Digital Assessment 4.0 - Errore", fontsize=16, color='#DC2626')
+        ax.axis('off')
+        
+        # Box rosso
+        ax.add_patch(plt.Rectangle((0.1, 0.1), 0.8, 0.8, fill=True, 
+                                  facecolor='#FEF2F2', edgecolor='#FCA5A5', linewidth=3))
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        buf.seek(0)
+        
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except Exception as e:
+        print(f"Errore anche nell'immagine di errore: {e}")
+        raise HTTPException(status_code=500, detail="Errore critico grafico")
+
+def create_emergency_chart(error_msg):
+    """Chart di emergenza assoluta"""
+    try:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.text(0.5, 0.5, f'EMERGENZA RADAR\n{error_msg[:50]}', 
+               ha='center', va='center', fontsize=14, color='red')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title("Errore Critico", fontsize=16, color='red')
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=100, bbox_inches='tight', facecolor='yellow')
+        plt.close(fig)
+        buf.seek(0)
+        
+        return StreamingResponse(buf, media_type="image/png")
+        
+    except:
+        raise HTTPException(status_code=500, detail="Errore catastrofico")
+
+# ============================================================================
+# FUNZIONI DI SUPPORTO PER SVG
+# ============================================================================
+
+def create_radar_svg(dimensions, process_name):
+    """Crea radar SVG per singolo processo"""
+    size = 300
+    center = size / 2
+    max_radius = 100
+    
+    labels = list(dimensions.keys())
+    values = list(dimensions.values())
+    
+    num_points = 4
+    angle_step = 2 * math.pi / num_points
+    
+    radar_points = []
+    for i, value in enumerate(values):
+        angle = i * angle_step - math.pi / 2
+        radius = (value / 5) * max_radius
+        x = center + radius * math.cos(angle)
+        y = center + radius * math.sin(angle)
+        radar_points.append((x, y))
+    
+    svg = f'''<svg width="{size}" height="{size}" xmlns="http://www.w3.org/2000/svg">
+    <rect width="{size}" height="{size}" fill="white" stroke="#e5e7eb"/>
+    
+    <g stroke="#e5e7eb" fill="none">
+        <circle cx="{center}" cy="{center}" r="{max_radius * 0.2}"/>
+        <circle cx="{center}" cy="{center}" r="{max_radius * 0.4}"/>
+        <circle cx="{center}" cy="{center}" r="{max_radius * 0.6}"/>
+        <circle cx="{center}" cy="{center}" r="{max_radius * 0.8}"/>
+        <circle cx="{center}" cy="{center}" r="{max_radius}"/>
+    </g>
+    
+    <g stroke="#e5e7eb">'''
+    
+    for i in range(num_points):
+        angle = i * angle_step - math.pi / 2
+        end_x = center + max_radius * math.cos(angle)
+        end_y = center + max_radius * math.sin(angle)
+        svg += f'<line x1="{center}" y1="{center}" x2="{end_x}" y2="{end_y}"/>'
+    
+    svg += '''</g>
+    
+    <polygon points="'''
+    
+    for x, y in radar_points:
+        svg += f"{x:.1f},{y:.1f} "
+    
+    svg += f'''" fill="#3B82F6" fill-opacity="0.25" stroke="#3B82F6" stroke-width="2"/>
+    
+    <g fill="#3B82F6">'''
+    
+    for x, y in radar_points:
+        svg += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4"/>'
+    
+    svg += '''</g>
+    
+    <g font-family="Arial" font-weight="bold" text-anchor="middle">'''
+    
+    for i, (label, value) in enumerate(zip(labels, values)):
+        angle = i * angle_step - math.pi / 2
+        label_radius = max_radius + 25
+        x = center + label_radius * math.cos(angle)
+        y = center + label_radius * math.sin(angle) + 5
+        
+        svg += f'<text x="{x:.1f}" y="{y:.1f}" fill="#374151" font-size="12">{label}</text>'
+        svg += f'<text x="{x:.1f}" y="{y + 15:.1f}" fill="#3B82F6" font-size="11">({value:.1f})</text>'
+    
+    svg += f'''</g>
+    
+    <text x="{center}" y="20" font-family="Arial" font-size="14" font-weight="bold" 
+          text-anchor="middle" fill="#1F2937">{process_name}</text>
+    
+    <g font-family="Arial" font-size="9" fill="#6B7280" text-anchor="middle">
+        <text x="{center}" y="{center - max_radius * 0.8 + 3}">4</text>
+        <text x="{center}" y="{center - max_radius * 0.6 + 3}">3</text>
+        <text x="{center}" y="{center - max_radius * 0.4 + 3}">2</text>
+        <text x="{center}" y="{center - max_radius * 0.2 + 3}">1</text>
+        <text x="{center}" y="{center + 3}">0</text>
+    </g>
+</svg>'''
+    
+    return svg
+
+def create_summary_radar_svg_classic(processes_scores):
+    """Crea un radar SVG classico per tutti i processi"""
+    if not processes_scores:
+        return create_placeholder_summary_radar_svg()
+    
+    size = 500  # Più grande per molti processi
+    center = size / 2
+    max_radius = 180
+    
+    processes = list(processes_scores.keys())
+    values = list(processes_scores.values())
+    num_processes = len(processes)
+    
+    if num_processes == 0:
+        return create_placeholder_summary_radar_svg()
+    
+    # Colori distintivi
+    colors = ["#3B82F6", "#EF4444", "#10B981", "#F59E0B", "#8B5CF6", "#F97316", "#06B6D4", "#84CC16"]
+    
+    angle_step = 2 * math.pi / num_processes
+    
+    svg_parts = [
+        f'<svg width="{size}" height="{size}" xmlns="http://www.w3.org/2000/svg">',
+        f'<rect width="{size}" height="{size}" fill="white" stroke="#e5e7eb"/>',
+        
+        # Griglia circolare
+        '<g stroke="#e5e7eb" fill="none" stroke-width="1">',
+        f'<circle cx="{center}" cy="{center}" r="{max_radius * 0.2}"/>',
+        f'<circle cx="{center}" cy="{center}" r="{max_radius * 0.4}"/>',
+        f'<circle cx="{center}" cy="{center}" r="{max_radius * 0.6}"/>',
+        f'<circle cx="{center}" cy="{center}" r="{max_radius * 0.8}"/>',
+        f'<circle cx="{center}" cy="{center}" r="{max_radius}"/>',
+        '</g>'
+    ]
+    
+    # Linee radiali
+    svg_parts.append('<g stroke="#e5e7eb" stroke-width="1">')
+    for i in range(num_processes):
+        angle = i * angle_step - math.pi / 2
+        end_x = center + max_radius * math.cos(angle)
+        end_y = center + max_radius * math.sin(angle)
+        svg_parts.append(f'<line x1="{center}" y1="{center}" x2="{end_x:.1f}" y2="{end_y:.1f}"/>')
+    svg_parts.append('</g>')
+    
+    # Calcola punti radar
+    points = []
+    for i, value in enumerate(values):
+        angle = i * angle_step - math.pi / 2
+        radius = (value / 5) * max_radius
+        x = center + radius * math.cos(angle)
+        y = center + radius * math.sin(angle)
+        points.append((x, y))
+    
+    # Area radar principale
+    point_strings = [f"{x:.1f},{y:.1f}" for x, y in points]
+    svg_parts.append(f'<polygon points="{" ".join(point_strings)}" fill="#2E86AB" fill-opacity="0.2" stroke="#2E86AB" stroke-width="3"/>')
+    
+    # Punti individuali colorati e più grandi
+    svg_parts.append('<g>')
+    for i, (x, y) in enumerate(points):
+        color = colors[i % len(colors)]
+        svg_parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="{color}" stroke="white" stroke-width="3"/>')
+    svg_parts.append('</g>')
+    
+    # Labels processi ottimizzati
+    svg_parts.append('<g font-family="Arial, sans-serif" text-anchor="middle">')
+    font_size = max(9, min(12, 16 - num_processes))  # Font adattivo
+    
+    for i, (process, value) in enumerate(processes_scores.items()):
+        angle = i * angle_step - math.pi / 2
+        label_radius = max_radius + 40
+        x = center + label_radius * math.cos(angle)
+        y = center + label_radius * math.sin(angle)
+        
+        # Tronca nomi intelligentemente
+        if len(process) > 15:
+            words = process.split()
+            if len(words) > 1:
+                display_name = f"{words[0][:8]} {words[1][:3]}..."
+            else:
+                display_name = process[:12] + "..."
+        else:
+            display_name = process
+        
+        color = colors[i % len(colors)]
+        
+        svg_parts.append(f'<text x="{x:.1f}" y="{y:.1f}" fill="{color}" font-size="{font_size}" font-weight="bold">{display_name}</text>')
+        svg_parts.append(f'<text x="{x:.1f}" y="{y + 14:.1f}" fill="#374151" font-size="{font_size-1}">({value:.1f})</text>')
+    svg_parts.append('</g>')
+    
+    # Titoli
+    svg_parts.append(f'<text x="{center}" y="30" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#1F2937">Digital Assessment 4.0</text>')
+    svg_parts.append(f'<text x="{center}" y="50" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#6B7280">Radar Classico - {num_processes} Processi</text>')
+    
+    # Scala numerica con stile migliorato
+    svg_parts.append('<g font-family="Arial, sans-serif" font-size="11" fill="#4B5563" text-anchor="middle" font-weight="bold">')
+    for i, val in enumerate([5, 4, 3, 2, 1]):
+        radius_pos = max_radius * (0.2 * (5-i))
+        svg_parts.append(f'<text x="{center}" y="{center - radius_pos + 4}">{val}</text>')
+    svg_parts.append('</g>')
+    
+    svg_parts.append('</svg>')
+    
+    return '\n'.join(svg_parts)
+
+def create_placeholder_radar_svg(process_name):
+    """SVG placeholder processo"""
+    return f'''<svg width="300" height="300" xmlns="http://www.w3.org/2000/svg">
+    <rect width="300" height="300" fill="#f9fafb" stroke="#e5e7eb"/>
+    <circle cx="150" cy="150" r="80" fill="none" stroke="#e5e7eb" stroke-width="2"/>
+    <text x="150" y="140" font-family="Arial" font-size="12" text-anchor="middle" fill="#6b7280">
+        Dati non disponibili
+    </text>
+    <text x="150" y="160" font-family="Arial" font-size="14" font-weight="bold" text-anchor="middle" fill="#374151">
+        {process_name[:20]}
+    </text>
+</svg>'''
+
+def create_error_radar_svg(process_name):
+    """SVG errore processo"""
+    return f'''<svg width="300" height="300" xmlns="http://www.w3.org/2000/svg">
+    <rect width="300" height="300" fill="#fef2f2" stroke="#fca5a5"/>
+    <text x="150" y="140" font-family="Arial" font-size="12" text-anchor="middle" fill="#dc2626">
+        Errore generazione radar
+    </text>
+    <text x="150" y="160" font-family="Arial" font-size="14" font-weight="bold" text-anchor="middle" fill="#991b1b">
+        {process_name[:20]}
+    </text>
+</svg>'''
+
+def create_placeholder_summary_radar_svg():
+    """SVG placeholder riassuntivo"""
+    return '''<svg width="500" height="500" xmlns="http://www.w3.org/2000/svg">
+    <rect width="500" height="500" fill="#f9fafb" stroke="#e5e7eb"/>
+    <circle cx="250" cy="250" r="150" fill="none" stroke="#e5e7eb" stroke-width="2"/>
+    <circle cx="250" cy="250" r="100" fill="none" stroke="#e5e7eb" stroke-width="1"/>
+    <circle cx="250" cy="250" r="50" fill="none" stroke="#e5e7eb" stroke-width="1"/>
+    <text x="250" y="240" font-family="Arial" font-size="16" text-anchor="middle" fill="#6b7280">
+        Nessun dato disponibile
+    </text>
+    <text x="250" y="260" font-family="Arial" font-size="18" font-weight="bold" text-anchor="middle" fill="#374151">
+        Radar Classico
+    </text>
+</svg>'''
+
+def create_error_summary_radar_svg():
+    """SVG errore riassuntivo"""
+    return '''<svg width="500" height="500" xmlns="http://www.w3.org/2000/svg">
+    <rect width="500" height="500" fill="#fef2f2" stroke="#fca5a5"/>
+    <text x="250" y="240" font-family="Arial" font-size="16" text-anchor="middle" fill="#dc2626">
+        Errore generazione
+    </text>
+    <text x="250" y="260" font-family="Arial" font-size="18" font-weight="bold" text-anchor="middle" fill="#991b1b">
+        Radar Classico
+    </text>
+</svg>'''
